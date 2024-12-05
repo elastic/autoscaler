@@ -49,6 +49,8 @@ const (
 	BootDiskSizeAnnotation = "cluster-autoscaler/gce/boot-disk-size"
 	// EphemeralStorageLocalSsdAnnotation is the annotation for nodes where ephemeral storage is backed up by local SSDs.
 	EphemeralStorageLocalSsdAnnotation = "cluster-autoscaler/gce/ephemeral-storage-local-ssd"
+
+	autoscalerVariablesKey = "AUTOSCALER_ENV_VARS"
 )
 
 // TODO: This should be imported from sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common/constants.go
@@ -257,7 +259,7 @@ func (t *GceTemplateBuilder) BuildNodeFromTemplate(mig Mig, migOsInfo MigOsInfo,
 }
 
 func ephemeralStorageLocalSSDCount(kubeEnv KubeEnv) int64 {
-	v, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "ephemeral_storage_local_ssd_count")
+	v, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "ephemeral_storage_local_ssd_count")
 	if err != nil {
 		klog.Warningf("cannot extract ephemeral_storage_local_ssd_count from kube-env, default to 0: %v", err)
 		return 0
@@ -302,7 +304,7 @@ func getEphemeralStorageOnLocalSsd(localSsdCount, ephemeralStorageLocalSsdCount,
 // picked up from Instance Template and used as Ephemeral Storage, in case other type of storage are used
 // as ephemeral storage
 func isBootDiskEphemeralStorageWithInstanceTemplateDisabled(kubeEnv KubeEnv) bool {
-	v, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "BLOCK_EPH_STORAGE_BOOT_DISK")
+	v, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "BLOCK_EPH_STORAGE_BOOT_DISK")
 	if err == nil && found && v == "true" {
 		return true
 	}
@@ -378,7 +380,7 @@ func extractLabelsFromKubeEnv(kubeEnv KubeEnv) (map[string]string, error) {
 	// In v1.10+, labels are only exposed for the autoscaler via AUTOSCALER_ENV_VARS
 	// see kubernetes/kubernetes#61119. We try AUTOSCALER_ENV_VARS first, then
 	// fall back to the old way.
-	labels, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "node_labels")
+	labels, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "node_labels")
 	if err != nil {
 		klog.Errorf("error while trying to extract node_labels from AUTOSCALER_ENV_VARS: %v", err)
 	}
@@ -397,7 +399,7 @@ func extractTaintsFromKubeEnv(kubeEnv KubeEnv) ([]apiv1.Taint, error) {
 	// In v1.10+, taints are only exposed for the autoscaler via AUTOSCALER_ENV_VARS
 	// see kubernetes/kubernetes#61119. We try AUTOSCALER_ENV_VARS first, then
 	// fall back to the old way.
-	taints, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "node_taints")
+	taints, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "node_taints")
 	if err != nil {
 		klog.Errorf("error while trying to extract node_taints from AUTOSCALER_ENV_VARS: %v", err)
 	}
@@ -415,7 +417,7 @@ func extractKubeReservedFromKubeEnv(kubeEnv KubeEnv) (string, error) {
 	// In v1.10+, kube-reserved is only exposed for the autoscaler via AUTOSCALER_ENV_VARS
 	// see kubernetes/kubernetes#61119. We try AUTOSCALER_ENV_VARS first, then
 	// fall back to the old way.
-	kubeReserved, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "kube_reserved")
+	kubeReserved, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "kube_reserved")
 	if err != nil {
 		klog.Errorf("error while trying to extract kube_reserved from AUTOSCALER_ENV_VARS: %v", err)
 	}
@@ -433,19 +435,33 @@ func extractKubeReservedFromKubeEnv(kubeEnv KubeEnv) (string, error) {
 }
 
 func extractExtendedResourcesFromKubeEnv(kubeEnv KubeEnv) (apiv1.ResourceList, error) {
-	extendedResourcesAsString, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "extended_resources")
+	const extendedResourcesKeyPrefix = "k8s.io/cluster-autoscaler/node-template/resources/"
+
+	extendedResourcesAsString, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "extended_resources")
 	if err != nil {
 		klog.Warningf("error while obtaining extended_resources from AUTOSCALER_ENV_VARS; %v", err)
 		return nil, err
 	}
 
-	if !found {
-		return apiv1.ResourceList{}, nil
+	var extendedResourcesMap map[string]string
+	if found {
+		extendedResourcesMap, err = parseKeyValueListToMap(extendedResourcesAsString)
+		if err != nil {
+			return apiv1.ResourceList{}, err
+		}
+	} else {
+		extendedResourcesMap = make(map[string]string)
 	}
-
-	extendedResourcesMap, err := parseKeyValueListToMap(extendedResourcesAsString)
+	prefixedExtendedResourcesMap, err := extractAutoscalerVariablesFromKubeEnvByPrefix(kubeEnv, extendedResourcesKeyPrefix)
 	if err != nil {
 		return apiv1.ResourceList{}, err
+	}
+	for key, value := range prefixedExtendedResourcesMap {
+		key = strings.TrimPrefix(key, extendedResourcesKeyPrefix)
+		extendedResourcesMap[key] = value
+	}
+	if len(extendedResourcesMap) == 0 {
+		return apiv1.ResourceList{}, nil
 	}
 
 	extendedResources := apiv1.ResourceList{}
@@ -453,7 +469,7 @@ func extractExtendedResourcesFromKubeEnv(kubeEnv KubeEnv) (apiv1.ResourceList, e
 		if q, err := resource.ParseQuantity(quantity); err == nil && q.Sign() >= 0 {
 			extendedResources[apiv1.ResourceName(name)] = q
 		} else if err != nil {
-			klog.Warningf("ignoring invalid value in extended_resources defined in AUTOSCALER_ENV_VARS; %v", err)
+			klog.Warningf("ignoring invalid extended resource value defined in AUTOSCALER_ENV_VARS; %v", err)
 		}
 	}
 	return extendedResources, nil
@@ -475,7 +491,7 @@ const (
 )
 
 func extractOperatingSystemFromKubeEnv(kubeEnv KubeEnv) OperatingSystem {
-	osValue, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "os")
+	osValue, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "os")
 	if err != nil {
 		klog.Errorf("error while obtaining os from AUTOSCALER_ENV_VARS; %v", err)
 		return OperatingSystemUnknown
@@ -578,7 +594,7 @@ func (s SystemArchitecture) Name() string {
 }
 
 func extractSystemArchitectureFromKubeEnv(kubeEnv KubeEnv) (SystemArchitecture, error) {
-	archName, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "arch")
+	archName, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "arch")
 	if err != nil {
 		return UnknownArch, fmt.Errorf("error while obtaining arch from AUTOSCALER_ENV_VARS: %v", err)
 	}
@@ -606,7 +622,7 @@ func ToSystemArchitecture(arch string) SystemArchitecture {
 }
 
 func extractOperatingSystemDistributionFromKubeEnv(kubeEnv KubeEnv) OperatingSystemDistribution {
-	osDistributionValue, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "os_distribution")
+	osDistributionValue, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "os_distribution")
 	if err != nil {
 		klog.Errorf("error while obtaining os from AUTOSCALER_ENV_VARS; %v", err)
 		return OperatingSystemDistributionUnknown
@@ -672,7 +688,7 @@ func getDurationOption(options map[string]string, templateName, name string) (ti
 }
 
 func extractAutoscalingOptionsFromKubeEnv(kubeEnv KubeEnv) (map[string]string, error) {
-	optionsAsString, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "autoscaling_options")
+	optionsAsString, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "autoscaling_options")
 	if err != nil {
 		klog.Warningf("error while obtaining autoscaling_options from AUTOSCALER_ENV_VARS: %v", err)
 		return nil, err
@@ -687,7 +703,7 @@ func extractAutoscalingOptionsFromKubeEnv(kubeEnv KubeEnv) (map[string]string, e
 }
 
 func extractEvictionHardFromKubeEnv(kubeEnv KubeEnv) (map[string]string, error) {
-	evictionHardAsString, found, err := extractAutoscalerVarFromKubeEnv(kubeEnv, "evictionHard")
+	evictionHardAsString, found, err := extractAutoscalerVarFromKubeEnvByName(kubeEnv, "evictionHard")
 	if err != nil {
 		klog.Warningf("error while obtaining eviction-hard from AUTOSCALER_ENV_VARS; %v", err)
 		return nil, err
@@ -701,9 +717,8 @@ func extractEvictionHardFromKubeEnv(kubeEnv KubeEnv) (map[string]string, error) 
 	return parseKeyValueListToMap(evictionHardAsString)
 }
 
-func extractAutoscalerVarFromKubeEnv(kubeEnv KubeEnv, name string) (value string, found bool, err error) {
-	const autoscalerVars = "AUTOSCALER_ENV_VARS"
-	autoscalerVals, found := kubeEnv.Var(autoscalerVars)
+func extractAutoscalerVarFromKubeEnvByName(kubeEnv KubeEnv, name string) (value string, found bool, err error) {
+	autoscalerVals, found := kubeEnv.Var(autoscalerVariablesKey)
 	if !found {
 		return "", false, nil
 	}
@@ -723,8 +738,33 @@ func extractAutoscalerVarFromKubeEnv(kubeEnv KubeEnv, name string) (value string
 			return strings.Trim(items[1], " \"'"), true, nil
 		}
 	}
-	klog.V(5).Infof("var %s not found in %s: %v", name, autoscalerVars, autoscalerVals)
+	klog.V(5).Infof("var %s not found in %s: %v", name, autoscalerVariablesKey, autoscalerVals)
 	return "", false, nil
+}
+
+func extractAutoscalerVariablesFromKubeEnvByPrefix(kubeEnv KubeEnv, prefix string) (map[string]string, error) {
+	autoscalerVariables, found := kubeEnv.Var(autoscalerVariablesKey)
+	autoscalerVariablesMap := make(map[string]string)
+	if !found {
+		return autoscalerVariablesMap, nil
+	}
+	if strings.Trim(autoscalerVariables, " ") == "" {
+		// empty or not present AUTOSCALER_ENV_VARS
+		return autoscalerVariablesMap, nil
+	}
+	for _, variable := range strings.Split(autoscalerVariables, ";") {
+		variable = strings.Trim(variable, " ")
+		items := strings.SplitN(variable, "=", 2)
+		if len(items) != 2 {
+			klog.Errorf("malformed autoscaler var: %s", variable)
+			continue
+		}
+		key := strings.Trim(items[0], " ")
+		if strings.HasPrefix(key, prefix) {
+			autoscalerVariablesMap[key] = strings.Trim(items[1], " \"'")
+		}
+	}
+	return autoscalerVariablesMap, nil
 }
 
 func parseKeyValueListToMap(kvList string) (map[string]string, error) {

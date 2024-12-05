@@ -743,7 +743,7 @@ func TestExtractAutoscalerVarFromKubeEnv(t *testing.T) {
 			var found bool
 			kubeEnv, err := ParseKubeEnv("test", c.kubeEnvValue)
 			if err == nil {
-				value, found, err = extractAutoscalerVarFromKubeEnv(kubeEnv, c.name)
+				value, found, err = extractAutoscalerVarFromKubeEnvByName(kubeEnv, c.name)
 			}
 			assert.Equal(t, c.expectedValue, value)
 			assert.Equal(t, c.expectedFound, found)
