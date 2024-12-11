@@ -19,6 +19,7 @@ package framework
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"k8s.io/client-go/informers"
 	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -29,6 +30,10 @@ import (
 	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
+var (
+	initMetricsOnce sync.Once
+)
+
 // Handle is meant for interacting with the scheduler framework.
 type Handle struct {
 	Framework        schedulerframework.Framework
@@ -36,7 +41,7 @@ type Handle struct {
 }
 
 // NewHandle builds a framework Handle based on the provided informers and scheduler config.
-func NewHandle(informerFactory informers.SharedInformerFactory, schedConfig *schedulerconfig.KubeSchedulerConfiguration) (*Handle, error) {
+func NewHandle(informerFactory informers.SharedInformerFactory, schedConfig *schedulerconfig.KubeSchedulerConfiguration, draEnabled bool) (*Handle, error) {
 	if schedConfig == nil {
 		var err error
 		schedConfig, err = schedulerconfiglatest.Default()
@@ -44,19 +49,27 @@ func NewHandle(informerFactory informers.SharedInformerFactory, schedConfig *sch
 			return nil, fmt.Errorf("couldn't create scheduler config: %v", err)
 		}
 	}
-
 	if len(schedConfig.Profiles) != 1 {
 		return nil, fmt.Errorf("unexpected scheduler config: expected one scheduler profile only (found %d profiles)", len(schedConfig.Profiles))
 	}
-	sharedLister := NewDelegatingSchedulerSharedLister()
 
-	schedulermetrics.InitMetrics()
+	sharedLister := NewDelegatingSchedulerSharedLister()
+	opts := []schedulerframeworkruntime.Option{
+		schedulerframeworkruntime.WithInformerFactory(informerFactory),
+		schedulerframeworkruntime.WithSnapshotSharedLister(sharedLister),
+	}
+	if draEnabled {
+		opts = append(opts, schedulerframeworkruntime.WithSharedDRAManager(sharedLister))
+	}
+
+	initMetricsOnce.Do(func() {
+		schedulermetrics.InitMetrics()
+	})
 	framework, err := schedulerframeworkruntime.NewFramework(
 		context.TODO(),
 		schedulerplugins.NewInTreeRegistry(),
 		&schedConfig.Profiles[0],
-		schedulerframeworkruntime.WithInformerFactory(informerFactory),
-		schedulerframeworkruntime.WithSnapshotSharedLister(sharedLister),
+		opts...,
 	)
 
 	if err != nil {
